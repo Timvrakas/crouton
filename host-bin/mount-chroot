@@ -12,6 +12,8 @@ CREATE=''
 ENCRYPT=''
 KEYFILE=''
 PRINT=''
+UKEYS=''
+UKEYFILE=''
 ROOT="`readlink -m '/var/run/crouton'`"
 MOUNTOPTS='rw,dev,exec,suid'
 
@@ -27,13 +29,14 @@ Options:
                 If unspecified, the keys will be stored in the chroot if doing a
                 first encryption, or auto-detected on existing chroots.
     -n          Create the chroot if it doesn't exist.
-    -p          Prints out the path to the mounted directory on stdout."
+    -p          Prints out the path to the mounted directory on stdout.
+    -u          Add unencrypted keys to ~/crouton/(chrootname).chkey"
 
 # Common functions
 . "$BINDIR/../installer/functions"
 
 # Process arguments
-getopts_string='c:ek:np'
+getopts_string='c:ek:npu'
 while getopts_nextarg; do
     case "$getopts_var" in
     c) CHROOTS="`readlink -m -- "$getopts_arg"`";;
@@ -41,6 +44,7 @@ while getopts_nextarg; do
     k) KEYFILE="$getopts_arg";;
     n) CREATE='y';;
     p) PRINT='y';;
+    u) UKEYS='y';;
     \?) error 2 "$USAGE";;
     esac
 done
@@ -60,6 +64,12 @@ addtrap "stty echo 2>/dev/null"
 
 # Function to prompt the user for a passphrase. Sets $passphrase.
 promptNewPassphrase() {
+
+# We must be on a terminal, unless we already have a password in env or are using unencrypted keys.
+if [ ! -t 0 -a -z "$CROUTON_PASSPHRASE$CROUTON_NEW_PASSPHRASE" -a -z "$UKEYS" ]; then
+    error 2 'STDIN is not a terminal; cannot request passwords.'
+fi
+
     echo -n "Choose an encryption passphrase for $NAME: " 1>&2
     [ -t 0 ] && stty -echo
     while [ -z "$passphrase" ]; do
@@ -131,11 +141,6 @@ for NAME in "$@"; do
             continue
         fi
 
-        # We must be on a terminal, unless we already have a password in env.
-        if [ ! -t 0 -a -z "$CROUTON_PASSPHRASE$CROUTON_NEW_PASSPHRASE" ]; then
-            error 2 'STDIN is not a terminal; cannot request passwords.'
-        fi
-
         # Ensure that there's a root password set before decrypting the chroot,
         # unless the passphrase was specified via env, which isn't secure anyway
         if [ ! -f '/mnt/stateful_partition/etc/devmode.passwd' ]; then
@@ -145,10 +150,28 @@ for NAME in "$@"; do
             fi
         fi
 
-        # Detect the key file
+        # Detect unencrypted keys
+        if [ -z "$UKEYFILE" ]; then
+            UKEYFILE="/home/chronos/user/crouton/$NAME.chkey"
+            if [ -f "$UKEYFILE" ]; then
+                # Read first line (normally blank, unless pointing to another file)
+                header="`head -n1 "$UKEYFILE"`"
+                if [ -n "$header" ]; then
+                    UKEYFILE="$header"
+                fi
+            fi
+        elif [ "${UKEYFILE#/}" = "$UKEYFILE" ]; then
+                UKEYFILE="$PWD/$UKEYFILE"
+        fi
+        if ! mkdir -p "`dirname "$UKEYFILE"`"; then
+                error 1 "Unable to create directory for $UKEYFILE"
+        fi
+
+        # Detect encrypted keys
         if [ -z "$KEYFILE" ]; then
             KEYFILE="$CHROOTSRC/.ecryptfs"
             if [ -f "$KEYFILE" ]; then
+                # Read first line (normally blank, unless pointing to another file)
                 header="`head -n1 "$KEYFILE"`"
                 if [ -n "$header" ]; then
                     KEYFILE="$header"
@@ -164,15 +187,8 @@ for NAME in "$@"; do
             error 1 "Unable to create directory for $KEYFILE"
         fi
 
-        # If we just created it, choose and create the keyfile.
-        passphrase="${CROUTON_PASSPHRASE:-"$CROUTON_NEW_PASSPHRASE"}"
-        if [ ! -f "$CHROOTSRC/.ecryptfs" ]; then
-            if [ -e "$KEYFILE" ]; then
-                error 1 "Encryption key file $KEYFILE already exists. Refusing to overwrite!"
-            fi
-
-            promptNewPassphrase
-
+        # If the neither the encryted nor decrypted keyfiles were found, create them
+        if [ ! -f "$UKEYFILE" -a ! -f "$KEYFILE" ]; then
             if [ -z "$CROUTON_WEAK_RANDOM" ]; then
                 random="/dev/random"
                 echo 'Generating keys (move the mouse to generate entropy)...' 1>&2
@@ -183,6 +199,29 @@ for NAME in "$@"; do
             key="`hexdump -v -n32 -e'32/1 "%02x"' "$random"`"
             fnek="`hexdump -v -n32 -e'32/1 "%02x"' "$random"`"
             echo 'done' 1>&2
+
+            # If -u was specified, then create unencrypted keys
+            if [ -n "$UKEYS" ]; then
+                if [ ! -e "$UKEYFILE" ]; then
+                    echo 'Creating unencrypted keys in ~/crouton/' 1>&2
+                    echo > "$UKEYFILE"
+                    echo "$key" >> "$UKEYFILE"
+                    echo "$fnek" >> "$UKEYFILE"
+                else
+                    error 1 "Encryption key file $UKEYFILE already exists. Refusing to overwrite!"
+                fi
+                if [ ! -f "/home/chronos/user/crouton/$NAME.chkey" ]; then
+                    echo "$UKEYFILE" > "/home/chronos/user/crouton/$NAME.chkey"
+                fi
+            fi
+
+        # Create encrypted keys
+            passphrase="${CROUTON_PASSPHRASE:-"$CROUTON_NEW_PASSPHRASE"}"
+            if [ -e "$KEYFILE" ]; then
+                error 1 "Encryption key file $KEYFILE already exists. Refusing to overwrite!"
+            fi
+
+            promptNewPassphrase
 
             # Create key file
             wrappedkey="`mktemp`"
@@ -197,16 +236,35 @@ $passphrase" | ecryptfs-wrap-passphrase "$wrappedfnek" -
             if [ ! -f "$CHROOTSRC/.ecryptfs" ]; then
                 echo "$KEYFILE" > "$CHROOTSRC/.ecryptfs"
             fi
-        elif [ ! -f "$KEYFILE" ]; then
-            error 1 "Unable to find encryption key file $KEYFILE"
-        else
-            echo -n "Enter encryption passphrase for $NAME: " 1>&2
-            [ -t 0 ] && stty -echo
-            if [ -z "$passphrase" ]; then
-                read -r passphrase
+        fi
+
+        if [ -f "$UKEYFILE" ]; then
+            # Decrypt from unencrypted keys
+            key="`head -n 2 "$UKEYFILE" | tail -1`"
+            fnek="`head -n 3 "$UKEYFILE" | tail -1`"
+
+            keysig="`echo -n "$key" \
+                | ecryptfs-add-passphrase - 2>/dev/null \
+                | sed -n 's/.*\[\([0-9a-zA-Z]*\)\].*/\1/p'`"
+            fneksig="`echo -n "$fnek" \
+                | ecryptfs-add-passphrase - 2>/dev/null \
+                | sed -n 's/.*\[\([0-9a-zA-Z]*\)\].*/\1/p'`"
+            unset key fnek
+
+            if [ -z "$keysig" -o -z "$fneksig" ]; then
+                error 1 "Failed to decrypt $NAME."
             fi
-            [ -t 0 ] && stty echo
-            echo 1>&2
+
+        elif [ -f "$KEYFILE" ]; then
+            # Decrypt from encrypted keys
+
+            if [ -z "$passphrase" ]; then
+                echo -n "Enter encryption passphrase for $NAME: " 1>&2
+                [ -t 0 ] && stty -echo
+                read -r passphrase
+                [ -t 0 ] && stty echo
+                echo 1>&2
+            fi
 
             wrappedkey="`mktemp`"
             wrappedfnek="`mktemp`"
@@ -231,19 +289,42 @@ $passphrase" | ecryptfs-rewrap-passphrase "$wrappedfnek" -
 
                 unset oldpassphrase
             fi
-        fi
 
-        # Add keys to keychain and extract
-        keysig="`echo -n "$passphrase" \
-            | ecryptfs-unwrap-passphrase "$wrappedkey" - 2>/dev/null \
-            | ecryptfs-add-passphrase - 2>/dev/null \
-            | sed -n 's/.*\[\([0-9a-zA-Z]*\)\].*/\1/p'`"
-        fneksig="`echo -n "$passphrase" \
-            | ecryptfs-unwrap-passphrase "$wrappedfnek" - 2>/dev/null \
-            | ecryptfs-add-passphrase - 2>/dev/null \
-            | sed -n 's/.*\[\([0-9a-zA-Z]*\)\].*/\1/p'`"
-        if [ -z "$keysig" -o -z "$fneksig" ]; then
-            error 1 "Failed to decrypt $NAME."
+            # If requested, create unencrypted keys
+            if [ -n "$UKEYS" ]; then
+                key="`echo -n "$passphrase" \
+                | ecryptfs-unwrap-passphrase "$wrappedkey" - 2>/dev/null`"
+                fnek="`echo -n "$passphrase" \
+                | ecryptfs-unwrap-passphrase "$wrappedfnek" - 2>/dev/null`"
+
+                if [ ! -e "$UKEYFILE" ]; then
+                    echo 'Creating unencrypted keys in ~/crouton/' 1>&2
+                    echo > "$UKEYFILE"
+                    echo "$key" >> "$UKEYFILE"
+                    echo "$fnek" >> "$UKEYFILE"
+                else
+                    error 1 "Encryption key file $UKEYFILE already exists. Refusing to overwrite!"
+                fi
+		unset key fnek
+                if [ ! -f "/home/chronos/user/crouton/$NAME.chkey" ]; then
+                    echo "$UKEYFILE" > "/home/chronos/user/crouton/$NAME.chkey"
+                fi
+            fi
+
+            # Add keys to keychain and extract
+            keysig="`echo -n "$passphrase" \
+                | ecryptfs-unwrap-passphrase "$wrappedkey" - 2>/dev/null \
+                | ecryptfs-add-passphrase - 2>/dev/null \
+                | sed -n 's/.*\[\([0-9a-zA-Z]*\)\].*/\1/p'`"
+            fneksig="`echo -n "$passphrase" \
+                | ecryptfs-unwrap-passphrase "$wrappedfnek" - 2>/dev/null \
+                | ecryptfs-add-passphrase - 2>/dev/null \
+                | sed -n 's/.*\[\([0-9a-zA-Z]*\)\].*/\1/p'`"
+            if [ -z "$keysig" -o -z "$fneksig" ]; then
+                error 1 "Failed to decrypt $NAME."
+            fi
+        else
+            error 1 "No usable keys found!"
         fi
 
         mnt="ecryptfs_sig=$keysig,ecryptfs_fnek_sig=$fneksig"

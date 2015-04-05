@@ -19,6 +19,7 @@ NEEDS_UNMOUNT=''
 RESTORE=''
 SPLIT=''
 TARBALL=''
+UKEYS=''
 YES=''
 YESPARAM=''
 
@@ -65,6 +66,8 @@ Options:
     -s SPLIT    Force a backup archive to be split into SPLIT-sized chunks.
                 SPLIT is specified in megabytes (1048576 bytes), and cannot be
                 smaller than 10.
+    -u          Create decrypted keys in user home, to use encryption without
+                a password
                 FAT32 filesystems are split by default to fit within 4GB.
     -y          Do all actions without confirmation."
 
@@ -72,7 +75,7 @@ Options:
 . "$BINDIR/../installer/functions"
 
 # Process arguments
-getopts_string='abc:def:k:lm:rs:y'
+getopts_string='abc:def:k:lm:rs:uy'
 while getopts_nextarg; do
     case "$getopts_var" in
     a) ALLCHROOTS='y';;
@@ -86,6 +89,7 @@ while getopts_nextarg; do
     m) MOVE="$getopts_arg"; NEEDS_UNMOUNT='y';;
     r) RESTORE=$(($RESTORE+1)); NEEDS_UNMOUNT='y';;
     s) SPLIT="$getopts_arg";;
+    u) UKEYS='y';;
     y) YES='a'; YESPARAM='-y';;
     \?) error 2 "$USAGE";;
     esac
@@ -98,7 +102,7 @@ if [ ! "${APPLICATION#delete}" = "$APPLICATION" ]; then
 fi
 
 # At least one command must be specified
-if [ -z "$ALLCHROOTS$BACKUP$DELETE$ENCRYPT$KEYFILE$LISTDETAILS$MOVE$RESTORE" ]; then
+if [ -z "$ALLCHROOTS$BACKUP$DELETE$ENCRYPT$KEYFILE$LISTDETAILS$MOVE$RESTORE$UKEYS" ]; then
     error 2 "$USAGE"
 fi
 
@@ -123,7 +127,7 @@ if [ -n "$BACKUP" -a -n "$RESTORE" ]; then
 fi
 
 # Cannot specify delete with anything else.
-if [ -n "$DELETE" -a -n "$BACKUP$ENCRYPT$KEYFILE$MOVE$RESTORE" ]; then
+if [ -n "$DELETE" -a -n "$BACKUP$ENCRYPT$KEYFILE$MOVE$RESTORE$UKEYS" ]; then
     error 2 "$USAGE"
 fi
 
@@ -240,7 +244,7 @@ Please specify all options before chroot names."
 done
 
 # Display all chroot names if using -a without any other operations.
-if [ -n "$ALLCHROOTS" -a -z "$BACKUP$DELETE$ENCRYPT$KEYFILE$LISTDETAILS$MOVE$RESTORE" ]; then
+if [ -n "$ALLCHROOTS" -a -z "$BACKUP$DELETE$ENCRYPT$KEYFILE$LISTDETAILS$MOVE$RESTORE$UKEYS" ]; then
     echo "$@"
     exit 0
 fi
@@ -533,6 +537,19 @@ for NAME in "$@"; do
             sh -e "$BINDIR/mount-chroot" -ee -k "$KEYFILE" -c "$CHROOTS" -- "$NAME"
         else
             sh -e "$BINDIR/mount-chroot" -ee -c "$CHROOTS" -- "$NAME"
+        fi
+        undotrap
+        eval "$unmount"
+    fi
+
+    # Create decrypted key for encrption without password
+    if [ -n "$UKEYS" ]; then
+        unmount="sh -e '$BINDIR/unmount-chroot' -y -c '$CHROOTS' -- '$NAME'"
+        addtrap "$unmount"
+        if [ -n "$KEYFILE" ]; then
+            sh -e "$BINDIR/mount-chroot" -e -u -k "$KEYFILE" -c "$CHROOTS" -- "$NAME"
+        else
+            sh -e "$BINDIR/mount-chroot" -e -u -c "$CHROOTS" -- "$NAME"
         fi
         undotrap
         eval "$unmount"
